@@ -18,17 +18,59 @@ async function* walk(dir) {
 }
 
 function matchBlock(src, tag, extra = '') {
-  const re = new RegExp(`<${tag}${extra}[^>]*>([\s\S]*?)<\/${tag}>`, 'i');
+  // Build a regex that captures the inner content of a tag. We use a
+  // catch‑all character class `[^]` to span across newlines rather than
+  // attempting to escape \s/\S sequences in a string passed to RegExp.
+  // The optional `extra` argument lets callers constrain the opening tag
+  // (e.g. match only <script setup> tags).
+  // Use a character class `[\\s\\S]` to match any character including newlines. When
+  // constructing the regex from a string, we must double escape backslashes so
+  // the resulting pattern contains `\s` and `\S` for whitespace/non-whitespace.
+  const re = new RegExp(
+    `<${tag}${extra}[^>]*>([\\s\\S]*?)<\\/${tag}>`,
+    'i'
+  );
   const m = src.match(re);
   return m ? m[1] : '';
 }
 
 function extractBlocks(src) {
   const template = matchBlock(src, 'template');
-  const scriptSetup = matchBlock(src, 'script', '\s+setup');
-  const script = matchBlock(src, 'script', '(?![\s\S]*setup)');
+  // Use explicit regular expressions (with RegExp constructor) to capture
+  // <script setup> and plain <script> blocks. We escape word boundary markers
+  // (\\b) so that the resulting pattern matches the word "setup" rather than
+  // containing a backspace character. The [^]*? character class matches any
+  // character including newlines.
+  const setupRe = new RegExp('<script[^>]*\\\\bsetup\\\\b[^>]*>([^]*?)<\\/script>', 'i');
+  const setupMatch = src.match(setupRe);
+  const scriptSetup = setupMatch ? setupMatch[1] : '';
+  const scriptRe = new RegExp('<script(?![^>]*\\\\bsetup\\\\b)[^>]*>([^]*?)<\\/script>', 'i');
+  const scriptMatch = src.match(scriptRe);
+  const script = scriptMatch ? scriptMatch[1] : '';
   return { template, scriptSetup, script };
 }
+
+// -----------------------------------------------------------------------------
+// A replacement for `extractBlocks` that uses regex literals with the `[\s\S]`
+// character class to reliably match the contents of <script setup> and plain
+// <script> tags across newlines. The original `extractBlocks` implementation
+// builds its patterns via strings passed to `RegExp`, which can mishandle
+// escape sequences and fail to capture multi-line scripts. Instead of
+// modifying the original function directly (which could introduce context
+// matching issues for patches), we define this new helper and use it in
+// `analyzeSFC` below.
+function extractBlocksFixed(src) {
+  const template = matchBlock(src, 'template');
+  // Match <script setup> blocks with a regex literal; use [\s\S] to match any
+  // character including newlines.
+  const setupMatch = src.match(/<script[^>]*\bsetup\b[^>]*>([\s\S]*?)<\/script>/i);
+  const scriptSetup = setupMatch ? setupMatch[1] : '';
+  // Match plain <script> blocks (those without the setup attribute).
+  const scriptMatch = src.match(/<script(?![^>]*\bsetup\b)[^>]*>([\s\S]*?)<\/script>/i);
+  const script = scriptMatch ? scriptMatch[1] : '';
+  return { template, scriptSetup, script };
+}
+
 
 // --- Heuristic parsers (no AST) ---
 function parseDefineProps(scriptSetup) {
@@ -36,12 +78,38 @@ function parseDefineProps(scriptSetup) {
   // 1) defineProps<T>() — capture within angle brackets
   const generic = scriptSetup.match(/defineProps\s*<([\s\S]*?)>\s*\(\s*\)/m);
   if (generic) {
-    // extremely loose: pick lines like `name?: string` or `name: string`
-    const body = generic[1];
-    const propLines = body.split(/\n|;/).map(s => s.trim()).filter(Boolean);
-    for (const line of propLines) {
-      const m = line.match(/^(\w+)(\??)\s*:\s*([^=]+)/);
-      if (m) results.push({ name: m[1], required: m[2] !== '?', type: m[3].trim(), from: 'script-setup-generic' });
+    // The content inside the angle brackets may be an inline type literal or a reference to
+    // a named interface. We inspect the raw text to decide how to parse it.
+    const bodyRaw = generic[1].trim();
+    if (/[{}]/.test(bodyRaw)) {
+      // Inline type literal (e.g. { title: string; count?: number }): remove curly braces
+      // and parse each property definition.
+      const body = bodyRaw.replace(/[{}]/g, '');
+      const propLines = body.split(/\n|;/).map(s => s.trim()).filter(Boolean);
+      for (const line of propLines) {
+        const m = line.match(/^(\w+)(\??)\s*:\s*([^=]+)/);
+        if (m) {
+          const [, name, opt, type] = m;
+          results.push({ name, required: opt !== '?', type: type.trim(), from: 'script-setup-generic' });
+        }
+      }
+    } else {
+      // Named interface reference (e.g. Props). Attempt to find a local `interface` definition
+      // with the same name and extract its members.
+      const ifaceName = bodyRaw;
+      const ifaceRe = new RegExp(`interface\\s+${ifaceName}\\s*\\{([\\s\\S]*?)\\}`);
+      const ifaceMatch = scriptSetup.match(ifaceRe);
+      if (ifaceMatch) {
+        const ifaceBody = ifaceMatch[1];
+        const propLines = ifaceBody.split(/\n|;/).map(s => s.trim()).filter(Boolean);
+        for (const line of propLines) {
+          const m = line.match(/^(\w+)(\??)\s*:\s*([^=]+)/);
+          if (m) {
+            const [, name, opt, type] = m;
+            results.push({ name, required: opt !== '?', type: type.trim(), from: 'script-setup-generic' });
+          }
+        }
+      }
     }
   }
   // 2) defineProps({ ... }) — object literal form
@@ -70,10 +138,23 @@ function parseDefineProps(scriptSetup) {
 
 function parseOptionsProps(script) {
   const results = [];
-  const match = script.match(/props\s*:\s*\{([\s\S]*?)\}\s*,?/m);
+  // Look for an Options API props declaration: `props:` followed by an object literal.
+  // We use a regex to find the literal `props` key followed by a colon and an opening brace.
+  const match = script.match(/props\s*:\s*\{/m);
   if (!match) return results;
-  const body = match[1];
-  const propRegex = /(\w+)\s*:\s*(?:\{([\s\S]*?)\}|([A-Za-z]+))/g;
+  const braceStart = match.index + match[0].lastIndexOf('{');
+  // Walk through the script from the opening brace to find the matching closing brace.
+  let level = 1;
+  let i = braceStart + 1;
+  while (i < script.length && level > 0) {
+    const ch = script[i];
+    if (ch === '{') level++;
+    else if (ch === '}') level--;
+    i++;
+  }
+  const body = script.slice(braceStart + 1, i - 1);
+  // Regex to capture property definitions: name: type OR name: { ... }
+  const propRegex = /(\w+)\s*:\s*(?:\{([^]*?)\}|([A-Za-z_$][\w$]*))/g;
   let m;
   while ((m = propRegex.exec(body))) {
     const name = m[1];
@@ -81,7 +162,8 @@ function parseOptionsProps(script) {
       results.push({ name, type: m[3], required: false, from: 'options' });
     } else {
       const objBody = m[2] || '';
-      const type = (objBody.match(/type\s*:\s*([A-Za-z]+)/) || [])[1] || 'unknown';
+      const typeMatch = objBody.match(/type\s*:\s*([A-Za-z_$][\w$]*)/);
+      const type = typeMatch ? typeMatch[1] : 'unknown';
       const required = /required\s*:\s*true/.test(objBody);
       const defM = objBody.match(/default\s*:\s*([^,}]+)/);
       const def = defM ? defM[1].trim() : undefined;
@@ -98,7 +180,7 @@ function parseDefineEmits(scriptSetup, script) {
   if (em) {
     const list = em[1].split(',').map(s => s.trim()).filter(Boolean);
     for (const item of list) {
-      const m = item.match(/['"]([^'"]+)['"]);
+      const m = item.match(/['"]([^'\"]+)['"]/);
       if (m) events.add(m[1]);
     }
   }
@@ -170,7 +252,8 @@ function propUsage(template, props) {
 }
 
 function analyzeSFC(src, file) {
-  const { template, scriptSetup, script } = extractBlocks(src);
+  // Use the fixed block extractor which handles multi-line <script setup> blocks.
+  const { template, scriptSetup, script } = extractBlocksFixed(src);
   const props = [
     ...parseDefineProps(scriptSetup),
     ...parseOptionsProps(script)
